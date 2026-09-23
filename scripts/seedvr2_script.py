@@ -60,6 +60,7 @@ class Script(scripts.Script):
         with gr.Row():
             unload_sd = gr.Checkbox(label="Unload SD Checkpoint", value=True, elem_classes="force-unload")
             save_original = gr.Checkbox(label="Save Extra Copy of Original", value=False)
+            auto_save_result = gr.Checkbox(label="Auto-save SeedVR2 Result", value=False)
             force_reload = gr.Checkbox(label="Force Reload", value=False)
             debug_mode = gr.Checkbox(label="Show Debug Logs", value=False)
 
@@ -74,9 +75,9 @@ class Script(scripts.Script):
                 tile_size = gr.Slider(label="Tile Size", minimum=512, maximum=2048, step=128, value=1024)
                 tile_overlap = gr.Slider(label="Tile Overlap", minimum=64, maximum=512, step=32, value=128)
 
-        return [dit_model, vae_model, seed, resolution, input_noise, latent_noise, force_reload, unload_sd, save_original, use_tile_vae, tile_size, tile_overlap, debug_mode]
+        return [dit_model, vae_model, seed, resolution, input_noise, latent_noise, force_reload, unload_sd, save_original, auto_save_result, use_tile_vae, tile_size, tile_overlap, debug_mode]
 
-    def run(self, p, dit_model_name, vae_model_name, seed, resolution, input_noise, latent_noise, force_reload, unload_sd, save_original, use_tile_vae, tile_size, tile_overlap, debug_mode):
+    def run(self, p, dit_model_name, vae_model_name, seed, resolution, input_noise, latent_noise, force_reload, unload_sd, save_original, auto_save_result, use_tile_vae, tile_size, tile_overlap, debug_mode):
         if EXTENSION_ROOT not in sys.path:
             sys.path.insert(0, EXTENSION_ROOT)
         
@@ -281,29 +282,101 @@ class Script(scripts.Script):
             out_np = (tensor_f32.numpy() * 255.0).astype(np.uint8)
             out_pil = Image.fromarray(out_np)
 
-            # 保存
+            # 保存 / Gallery metadata
+            # Forge Neo's save button parses Processed.infotexts and requires
+            # a normal A1111-style final parameter line containing Seed.
             p.extra_generation_params["SeedVR2 Model"] = dit_model_name
-            p.extra_generation_params["SeedVR2 Resolution"] = resolution
-            
-            try:
-                infotext = create_infotext(p, p.all_prompts, p.all_seeds, p.all_subseeds, index=0)
-            except:
-                infotext = ""
+            p.extra_generation_params["SeedVR2 Resolution"] = int(resolution)
 
-            images.save_image(
-                out_pil, 
-                p.outpath_samples, 
-                "", 
-                args.seed, 
-                p.prompt, 
-                shared.opts.samples_format, 
-                info=infotext,
-                p=p,
-                suffix="-seedvr2"
+            prompt_text = p.prompt[0] if isinstance(p.prompt, list) and p.prompt else (p.prompt or "")
+            negative_prompt_text = (
+                p.negative_prompt[0]
+                if isinstance(p.negative_prompt, list) and p.negative_prompt
+                else (p.negative_prompt or "")
             )
 
+            # Use the SeedVR2 seed (which may differ from the base-generation seed).
+            info_prompts = [prompt_text]
+            info_negative_prompts = [negative_prompt_text]
+            info_seeds = [int(args.seed)]
+            info_subseeds = [
+                int(p.all_subseeds[0])
+                if getattr(p, "all_subseeds", None)
+                else int(getattr(p, "subseed", -1) or -1)
+            ]
+
+            try:
+                infotext = create_infotext(
+                    p,
+                    info_prompts,
+                    info_seeds,
+                    info_subseeds,
+                    index=0,
+                    all_negative_prompts=info_negative_prompts,
+                )
+
+                # create_infotext uses p.width/p.height. For SeedVR2 the gallery
+                # contains the upscaled image, so replace Size with output size.
+                lines = infotext.split("\n")
+                if lines:
+                    import re
+                    lines[-1] = re.sub(
+                        r"(?:^|, )Size: \d+x\d+",
+                        lambda m: (", " if m.group(0).startswith(", ") else "")
+                        + f"Size: {out_pil.width}x{out_pil.height}",
+                        lines[-1],
+                        count=1,
+                    )
+                    infotext = "\n".join(lines)
+            except Exception as info_error:
+                if debug_mode:
+                    print(f"[SeedVR2] create_infotext fallback: {info_error}")
+
+                # Parser-compatible fallback: Forge Neo requires at least three
+                # comma-separated parameters on the final line.
+                prompt_part = prompt_text
+                if negative_prompt_text:
+                    prompt_part += f"\nNegative prompt: {negative_prompt_text}"
+                infotext = (
+                    f"{prompt_part}\n"
+                    f"Seed: {int(args.seed)}, "
+                    f"Size: {out_pil.width}x{out_pil.height}, "
+                    f"SeedVR2 Model: {dit_model_name}, "
+                    f"SeedVR2 Resolution: {int(resolution)}"
+                ).strip()
+
+            # Automatic disk saving is optional. When disabled, the result is
+            # only shown in the gallery and can still be saved manually with
+            # Forge Neo's floppy-disk button.
+            if auto_save_result:
+                images.save_image(
+                    out_pil,
+                    p.outpath_samples,
+                    "",
+                    args.seed,
+                    prompt_text,
+                    shared.opts.samples_format,
+                    info=infotext,
+                    p=p,
+                    suffix="-seedvr2"
+                )
+
             if not debug_mode: print("[SeedVR2] Done.")
-            return Processed(p, [out_pil], args.seed, f"SeedVR2 Upscaled")
+
+            # IMPORTANT: pass the real infotext to Processed. The Forge Neo
+            # floppy-disk button reads processed.infotexts, not the text that
+            # was only embedded into the image file above.
+            return Processed(
+                p,
+                [out_pil],
+                seed=int(args.seed),
+                info=infotext,
+                all_prompts=info_prompts,
+                all_negative_prompts=info_negative_prompts,
+                all_seeds=info_seeds,
+                all_subseeds=info_subseeds,
+                infotexts=[infotext],
+            )
 
         except SeedVR2Interrupted:
             print("\n⏹️ [SeedVR2] Process Interrupted by User.")
