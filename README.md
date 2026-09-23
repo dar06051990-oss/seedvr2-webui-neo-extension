@@ -1,4 +1,16 @@
 ﻿# seedvr2-webui-neo-extension
+ ## Forge Neo compatibility fixes
+
+This fork adds several fixes for Forge Neo:
+
+- fixes the 💾 save/download button after SeedVR2 upscaling;
+- preserves Seed and generation infotext correctly;
+- adds an optional **Auto-save SeedVR2 Result** setting;
+- auto-save is disabled by default, so results are not duplicated to the output folder unless enabled.
+
+Based on the original project by yamosin.
+
+---
 
 如果 `install.py`没有正确运行，请自己在环境里使用以下命令安装
 ```
