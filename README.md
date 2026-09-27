@@ -1,12 +1,25 @@
 ﻿# seedvr2-webui-neo-extension
- ## Forge Neo compatibility fixes
+ ## Forge Neo compatibility fixes and additions
 
-This fork adds several fixes for Forge Neo:
+This fork keeps the original SeedVR2 WebUI extension behavior and adds Forge Neo compatibility fixes plus extra model support:
 
 - fixes the 💾 save/download button after SeedVR2 upscaling;
 - preserves Seed and generation infotext correctly;
 - adds an optional **Auto-save SeedVR2 Result** setting;
-- auto-save is disabled by default, so results are not duplicated to the output folder unless enabled.
+- auto-save is disabled by default, so results are not duplicated to the output folder unless enabled;
+- adds an **Img2Img Mode** selector:
+  - **SeedVR2 only (upscale input image)** — original behavior;
+  - **Run Forge img2img, then SeedVR2** — runs the normal Forge img2img pipeline first and then upscales its result;
+- adds native loading for Forge/Comfy quantized `.safetensors` SeedVR2 models using `*.comfy_quant` metadata:
+  - **INT8 Tensorwise / ConvRot** (`int8_tensorwise`);
+  - **W4A8 ConvRot** (`asym_w4a8_int8`);
+  - **INT4 / W4A4 ConvRot** (`convrot_w4a4`);
+  - mixed INT4 checkpoints with INT8 fallback layers are supported;
+- quantized Linear weights remain packed in memory and execute through `comfy-kitchen` instead of being expanded to BF16 during loading.
+
+Regular FP16/BF16/FP8/GGUF loading paths remain available.
+
+Native quantized `.safetensors` support requires a Forge Neo build with `comfy-kitchen>=0.2.15` available.
 
 Based on the original project by yamosin.
 
@@ -42,7 +55,8 @@ Use this extension via the **Script** dropdown menu at the bottom of the page. G
 The script functions differently depending on the mode:
 
 *   **txt2img**: Performs SeedVR2 upscaling on the image *after* the generation process and all other extensions have completed.
-*   **img2img**: Bypasses the standard img2img processing and directly applies SeedVR2 upscaling to the input image.
+*   **img2img / SeedVR2 only**: Bypasses the standard img2img processing and directly applies SeedVR2 upscaling to the input image.
+*   **img2img / Run Forge img2img, then SeedVR2**: Runs the regular Forge img2img pipeline first, then applies SeedVR2 to the generated image.
 
 <img width="1660" height="694" alt="image" src="https://github.com/user-attachments/assets/777c34e7-aca6-4e51-9994-f02f817311ea" />
 
