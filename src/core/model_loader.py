@@ -118,7 +118,7 @@ class ComfyQuantLinear(torch.nn.Module):
     those tensors quantized here avoids expanding them to BF16 during model load.
     """
 
-    def __init__(self, original: torch.nn.Lodule, quant_format: str, config: Dict[str, Any],
+    def __init__(self, original: torch.nn.Linear, quant_format: str, config: Dict[str, Any],
                  weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
                  weight_scale: Optional[torch.Tensor] = None,
                  weight_s_rel: Optional[torch.Tensor] = None,
