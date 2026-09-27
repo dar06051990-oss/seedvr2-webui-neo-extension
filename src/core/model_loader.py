@@ -49,6 +49,7 @@ This module is used by model_configuration for weight loading during materializa
 """
 
 import os
+import json
 import torch
 from omegaconf import OmegaConf
 from typing import Dict, Any, Optional, Tuple, Union, Callable
@@ -79,6 +80,314 @@ from ..utils.constants import get_script_directory, suppress_tensor_warnings
 
 # Get script directory for config paths
 script_directory = get_script_directory()
+
+
+# ComfyUI/Forge native mixed-precision safetensors support.
+# Forge Neo already ships comfy-kitchen; keep imports lazy so regular FP/GGUF
+# checkpoints continue to work even in environments where comfy-kitchen is absent.
+_COMFY_KITCHEN_KERNELS = None
+
+
+def _get_comfy_kitchen_kernels():
+    global _COMFY_KITCHEN_KERNELS
+    if _COMFY_KITCHEN_KERNELS is not None:
+        return _COMFY_KITCHEN_KERNELS
+
+    try:
+        from comfy_kitchen import int8_linear, w4a8_int8_linear, convrot_w4a4_linear
+    except Exception as e:
+        raise ImportError(
+            "This SeedVR2 checkpoint uses Comfy/Forge native INT8/W4A8/W4A4 quantization, "
+            "but comfy-kitchen could not be imported. Update Forge Neo or install "
+            "comfy-kitchen>=0.2.15."
+        ) from e
+
+    _COMFY_KITCHEN_KERNELS = (int8_linear, w4a8_int8_linear, convrot_w4a4_linear)
+    return _COMFY_KITCHEN_KERNELS
+
+
+class ComfyQuantLinear(torch.nn.Module):
+    """Linear layer backed by Forge/Comfy native quantized safetensor weights.
+
+    Supported formats:
+      - int8_tensorwise (including ConvRot)
+      - asym_w4a8_int8 (W4A8 ConvRot)
+      - convrot_w4a4 (packed INT4 / W4A4 ConvRot)
+
+    The quantized checkpoint stores side tensors next to ``weight``.  Keeping
+    those tensors quantized here avoids expanding them to BF16 during model load.
+    """
+
+    def __init__(self, original: torch.nn.Lodule, quant_format: str, config: Dict[str, Any],
+                 weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
+                 weight_scale: Optional[torch.Tensor] = None,
+                 weight_s_rel: Optional[torch.Tensor] = None,
+                 weight_s_channel: Optional[torch.Tensor] = None,
+                 weight_codebook: Optional[torch.Tensor] = None,
+                 weight_correction: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.in_features = original.in_features
+        self.out_features = original.out_features
+        self.quant_format = quant_format
+
+        params = config.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        self.convrot = bool(config.get("convrot", params.get("convrot", False)))
+        self.convrot_groupsize = int(
+            config.get("convrot_groupsize", params.get("convrot_groupsize", 256))
+        )
+        self.group_size = int(config.get("group_size", params.get("group_size", 16)))
+        self.quant_group_size = int(
+            config.get("quant_group_size", params.get("quant_group_size", 64))
+        )
+        self.linear_dtype = str(
+            config.get("linear_dtype", params.get("linear_dtype", "int4"))
+        )
+
+        # Quantized storage never needs gradients.  The model is inference-only.
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        if bias is None:
+            self.register_parameter("bias", None)
+        else:
+            self.bias = torch.nn.Parameter(bias, requires_grad=False)
+
+        if weight_scale is not None:
+            self.register_buffer("weight_scale", weight_scale, persistent=True)
+        else:
+            self.register_buffer("weight_scale", None, persistent=True)
+
+        if weight_s_rel is not None and weight_s_rel.dtype == torch.uint8:
+            # Older/native Comfy checkpoints may serialize float8 scales as raw uint8.
+            weight_s_rel = weight_s_rel.view(torch.float8_e4m3fn)
+        self.register_buffer("weight_s_rel", weight_s_rel, persistent=True)
+        self.register_buffer("weight_s_channel", weight_s_channel, persistent=True)
+        self.register_buffer("weight_codebook", weight_codebook, persistent=True)
+        self.register_buffer("weight_correction", weight_correction, persistent=True)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        int8_linear, w4a8_int8_linear, convrot_w4a4_linear = _get_comfy_kitchen_kernels()
+        bias = self.bias
+        if bias is not None and bias.dtype != input.dtype:
+            bias = bias.to(dtype=input.dtype)
+
+        if self.quant_format == "int8_tensorwise":
+            if self.weight_scale is None:
+                raise RuntimeError("INT8 SeedVR2 layer is missing weight_scale")
+            return int8_linear(
+                input.contiguous(),
+                self.weight.contiguous(),
+                self.weight_scale,
+                bias=bias,
+                out_dtype=input.dtype,
+                convrot=self.convrot,
+                convrot_groupsize=self.convrot_groupsize,
+            )
+
+        if self.quant_format == "asym_w4a8_int8":
+            if self.weight_s_rel is None or self.weight_s_channel is None:
+                raise RuntimeError(
+                    "W4A8 SeedVR2 layer is missing weight_s_rel/weight_s_channel"
+                )
+            return w4a8_int8_linear(
+                input.contiguous(),
+                self.weight.contiguous(),
+                self.weight_s_rel,
+                self.weight_s_channel,
+                codebook=self.weight_codebook,
+                correction=self.weight_correction,
+                bias=bias,
+                group_size=self.group_size,
+                convrot_groupsize=self.convrot_groupsize,
+                out_dtype=input.dtype,
+            )
+
+        if self.quant_format == "convrot_w4a4":
+            if self.weight_scale is None:
+                raise RuntimeError("INT4/W4A4 SeedVR2 layer is missing weight_scale")
+            return convrot_w4a4_linear(
+                input.contiguous(),
+                self.weight.contiguous(),
+                self.weight_scale,
+                bias=bias,
+                convrot_groupsize=self.convrot_groupsize,
+                quant_group_size=self.quant_group_size,
+                linear_dtype=self.linear_dtype,
+            )
+
+        raise RuntimeError(f"Unsupported SeedVR2 quantization format: {self.quant_format}")
+
+
+def _decode_comfy_quant_marker(marker: torch.Tensor) -> Dict[str, Any]:
+    """Decode a ``*.comfy_quant`` uint8 JSON tensor."""
+    try:
+        raw = marker.detach().cpu().contiguous().numpy().tobytes()
+        text = raw.decode("utf-8").rstrip("\x00")
+        conf = json.loads(text)
+        return conf if isinstance(conf, dict) else {}
+    except Exception as e:
+        raise ValueError(f"Invalid comfy_quant metadata: {e}") from e
+
+
+def _find_comfy_quant_layers(state: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, Any]]:
+    layers = {}
+    suffix = ".comfy_quant"
+    for key, value in state.items():
+        if not key.endswith(suffix) or not torch.is_tensor(value):
+            continue
+        base = key[:-len(suffix)]
+        conf = _decode_comfy_quant_marker(value)
+        fmt = conf.get("format")
+        if fmt in {"int8_tensorwise", "asym_w4a8_int8", "convrot_w4a4"}:
+            layers[base] = conf
+    return layers
+
+
+def _get_module_by_path(model: torch.nn.Module, module_path: str) -> torch.nn.Module:
+    module = model
+    if module_path:
+        for part in module_path.split('.'):
+            module = getattr(module, part)
+    return module
+
+
+def _replace_module_by_path(model: torch.nn.Module, module_path: str, new_module: torch.nn.Module) -> None:
+    parent_path, _, child_name = module_path.rpartition('.')
+    parent = _get_module_by_path(model, parent_path) if parent_path else model
+    setattr(parent, child_name, new_module)
+
+
+def _load_comfy_quantized_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor],
+                                   used_meta: bool, model_type: str, model_type_lower: str,
+                                   debug: Optional['Debug'] = None) -> torch.nn.Module:
+    """Load native Comfy/Forge INT8/W4A8/W4A4 linear layers without dequantizing them."""
+    quant_layers = _find_comfy_quant_layers(state)
+    if not quant_layers:
+        return _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug)
+
+    # Fail early with a useful message before mutating the model.
+    _get_comfy_kitchen_kernels()
+
+    # Work on a shallow copy: tensor payloads are reused, but quant-specific keys are
+    # removed before the remaining regular weights are applied via load_state_dict.
+    remaining = dict(state)
+    counts = {"int8_tensorwise": 0, "asym_w4a8_int8": 0, "convrot_w4a4": 0}
+
+    for base, conf in quant_layers.items():
+        fmt = conf.get("format")
+        try:
+            original = _get_module_by_path(model, base)
+        except Exception as e:
+            raise KeyError(f"Quantized SeedVR2 layer not found in model: {base}") from e
+
+        if not isinstance(original, torch.nn.Linear):
+            raise TypeError(
+                f"Quantized SeedVR2 layer {base} is {type(original).__name__}, expected Linear"
+            )
+
+        weight_key = f"{base}.weight"
+        if weight_key not in remaining:
+            raise KeyError(f"Quantized SeedVR2 layer is missing weight: {weight_key}")
+        weight = remaining.pop(weight_key)
+        bias = remaining.pop(f"{base}.bias", None)
+        remaining.pop(f"{base}.comfy_quant", None)
+
+        kwargs = {}
+        if fmt == "int8_tensorwise":
+            scale = remaining.pop(f"{base}.weight_scale", None)
+            if scale is None:
+                raise KeyError(f"INT8 SeedVR2 layer is missing {base}.weight_scale")
+            kwargs["weight_scale"] = scale
+
+            if weight.dtype != torch.int8:
+                raise TypeError(
+                    f"INT8 SeedVR2 layer {base} has {weight.dtype} weight, expected torch.int8"
+                )
+            if weight.ndim != 2 or tuple(weight.shape) != (original.out_features, original.in_features):
+                raise ValueError(
+                    f"INT8 SeedVR2 layer {base} shape {tuple(weight.shape)} does not match "
+                    f"Linear({original.in_features}, {original.out_features})"
+                )
+
+        elif fmt == "asym_w4a8_int8":
+            s_rel = remaining.pop(f"{base}.weight_s_rel", None)
+            s_channel = remaining.pop(f"{base}.weight_s_channel", None)
+            codebook = remaining.pop(f"{base}.weight_codebook", None)
+            correction = remaining.pop(f"{base}.weight_correction", None)
+            if s_rel is None or s_channel is None:
+                raise KeyError(
+                    f"W4A8 SeedVR2 layer {base} is missing weight_s_rel/weight_s_channel"
+                )
+            kwargs.update(
+                weight_s_rel=s_rel,
+                weight_s_channel=s_channel,
+                weight_codebook=codebook,
+                weight_correction=correction,
+            )
+            if weight.dtype != torch.int8:
+                raise TypeError(
+                    f"W4A8 SeedVR2 layer {base} has {weight.dtype} packed weight, expected torch.int8"
+                )
+            expected_packed_k = (original.in_features + 1) // 2
+            if weight.ndim != 2 or weight.shape[0] != original.out_features or weight.shape[1] != expected_packed_k:
+                raise ValueError(
+                    f"W4A8 SeedVR2 layer {base} packed shape {tuple(weight.shape)} does not match "
+                    f"Linear({original.in_features}, {original.out_features})"
+                )
+
+        elif fmt == "convrot_w4a4":
+            scale = remaining.pop(f"{base}.weight_scale", None)
+            if scale is None:
+                raise KeyError(f"INT4/W4A4 SeedVR2 layer is missing {base}.weight_scale")
+            kwargs["weight_scale"] = scale
+
+            # comfy-kitchen stores ConvRot W4A4 as a packed signed 4-bit matrix.
+            # The physical storage shape is backend/layout specific, so do not
+            # compare it against the logical Linear [N, K] shape here.
+            if weight.ndim != 2:
+                raise ValueError(
+                    f"INT4/W4A4 SeedVR2 layer {base} has invalid packed shape {tuple(weight.shape)}"
+                )
+            if weight.dtype not in (torch.int8, torch.uint8):
+                raise TypeError(
+                    f"INT4/W4A4 SeedVR2 layer {base} has {weight.dtype} packed weight; "
+                    f"expected int8/uint8 storage"
+                )
+
+        quant_module = ComfyQuantLinear(
+            original=original,
+            quant_format=fmt,
+            config=conf,
+            weight=weight,
+            bias=bias,
+            **kwargs,
+        )
+        _replace_module_by_path(model, base, quant_module)
+        counts[fmt] += 1
+
+    debug.log(
+        f"Detected native quantized SeedVR2 weights: "
+        f"INT8 ConvRot={counts['int8_tensorwise']}, "
+        f"W4A8={counts['asym_w4a8_int8']}, "
+        f"INT4/W4A4 ConvRot={counts['convrot_w4a4']}",
+        category="precision", force=True
+    )
+
+    # Comfy converter checkpoints may carry baked conditioning for ComfyUI.
+    # This extension uses its bundled pos_emb.pt/neg_emb.pt, so those tensors are not model params.
+    remaining.pop("positive_conditioning", None)
+    remaining.pop("negative_conditioning", None)
+
+    debug.start_timer(f"{model_type_lower}_state_apply")
+    model.load_state_dict(remaining, strict=False, assign=True)
+    action = "materialized" if used_meta else "applied"
+    debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} mixed-precision weights {action}")
+    debug.log(
+        f"{model_type} native quantized weights loaded without BF16 expansion",
+        category="success", force=True
+    )
+    return model
 
 
 def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
@@ -586,9 +895,13 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     # Log weight statistics
     _log_weight_stats(state, used_meta, model_type, debug)
     
-    # Handle GGUF or standard loading
+    # Handle GGUF, native Comfy/Forge quantized safetensors, or standard loading
     if checkpoint_path.endswith('.gguf'):
         model = _load_gguf_weights(model, state, used_meta, model_type_lower, debug)
+    elif _find_comfy_quant_layers(state):
+        model = _load_comfy_quantized_weights(
+            model, state, used_meta, model_type, model_type_lower, debug
+        )
     else:
         model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug)
     
