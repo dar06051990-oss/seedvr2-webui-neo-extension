@@ -2,7 +2,7 @@ import os
 import sys
 import gradio as gr
 from modules import scripts, processing, images, shared
-from modules.processing import Processed, create_infotext, StableDiffusionProcessingTxt2Img
+from modules.processing import Processed, create_infotext, StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img
 from modules.ui_components import FormRow
 from torchvision import transforms
 import torch
@@ -56,6 +56,20 @@ class Script(scripts.Script):
         with gr.Row():
             seed = gr.Number(label="Seed (-1 = Random/Follow)", value=-1, precision=0)
             resolution = gr.Slider(label="Upscale Resolution (Shortest Edge)", minimum=512, maximum=3840, step=64, value=1080)
+
+        # In img2img the original extension bypasses Forge processing and sends
+        # p.init_images[0] straight to SeedVR2. Keep that legacy mode, but add a
+        # chained mode that first runs the normal Forge img2img pipeline and then
+        # upscales the generated result with SeedVR2.
+        img2img_mode = gr.Radio(
+            label="Img2Img Mode",
+            choices=[
+                ("SeedVR2 only (upscale input image)", "seedvr2_only"),
+                ("Run Forge img2img, then SeedVR2", "img2img_then_seedvr2"),
+            ],
+            value="seedvr2_only",
+            visible=is_img2img,
+        )
         
         with gr.Row():
             unload_sd = gr.Checkbox(label="Unload SD Checkpoint", value=True, elem_classes="force-unload")
@@ -75,9 +89,9 @@ class Script(scripts.Script):
                 tile_size = gr.Slider(label="Tile Size", minimum=512, maximum=2048, step=128, value=1024)
                 tile_overlap = gr.Slider(label="Tile Overlap", minimum=64, maximum=512, step=32, value=128)
 
-        return [dit_model, vae_model, seed, resolution, input_noise, latent_noise, force_reload, unload_sd, save_original, auto_save_result, use_tile_vae, tile_size, tile_overlap, debug_mode]
+        return [dit_model, vae_model, seed, resolution, img2img_mode, input_noise, latent_noise, force_reload, unload_sd, save_original, auto_save_result, use_tile_vae, tile_size, tile_overlap, debug_mode]
 
-    def run(self, p, dit_model_name, vae_model_name, seed, resolution, input_noise, latent_noise, force_reload, unload_sd, save_original, auto_save_result, use_tile_vae, tile_size, tile_overlap, debug_mode):
+    def run(self, p, dit_model_name, vae_model_name, seed, resolution, img2img_mode, input_noise, latent_noise, force_reload, unload_sd, save_original, auto_save_result, use_tile_vae, tile_size, tile_overlap, debug_mode):
         if EXTENSION_ROOT not in sys.path:
             sys.path.insert(0, EXTENSION_ROOT)
         
@@ -87,40 +101,71 @@ class Script(scripts.Script):
             if shared.state.interrupted:
                 raise SeedVR2Interrupted("User interrupted generation.")
 
-        # --- Txt2Img 自动劫持 ---
-        if isinstance(p, StableDiffusionProcessingTxt2Img):
-            if debug_mode: print("[SeedVR2] Generating base image (txt2img)...")
-            
+        def run_base_forge_generation(mode_name):
+            """Run Forge's normal generation once without recursively running SeedVR2."""
+            if debug_mode:
+                print(f"[SeedVR2] Generating base image ({mode_name})...")
+
             current_script = None
             if p.scripts is not None:
-                for s in p.scripts.scripts:
-                    if s.title() == self.title():
-                        current_script = s
+                for script_item in p.scripts.scripts:
+                    if script_item.title() == self.title():
+                        current_script = script_item
                         break
                 if current_script:
                     p.scripts.scripts.remove(current_script)
-            
+
             try:
-                processed_base = processing.process_images(p)
+                return processing.process_images(p)
             finally:
                 if current_script and p.scripts:
                     p.scripts.scripts.append(current_script)
-            
-            # ★★★ 修复：移除 .stopping 检查 ★★★
+
+        # --- Txt2Img / Img2Img chaining ---
+        if isinstance(p, StableDiffusionProcessingTxt2Img):
+            processed_base = run_base_forge_generation("txt2img")
+
             if shared.state.interrupted:
                 print("[SeedVR2] Interrupted during Txt2Img generation. Stopping SeedVR2.")
-                return processed_base # 直接返回半成品
+                return processed_base
+
+            if not processed_base.images:
+                return processed_base
 
             input_img = processed_base.images[0]
-            
+
             if save_original:
-                 images.save_image(input_img, p.outpath_samples, "", processed_base.seed, p.prompt, shared.opts.samples_format, info=processed_base.info, p=p, suffix="-original")
-            
-        else:
-            # Img2Img 模式
-            # ★★★ 修复：移除 .stopping 检查 ★★★
+                images.save_image(
+                    input_img, p.outpath_samples, "", processed_base.seed, p.prompt,
+                    shared.opts.samples_format, info=processed_base.info, p=p, suffix="-original"
+                )
+
+        elif isinstance(p, StableDiffusionProcessingImg2Img) and img2img_mode == "img2img_then_seedvr2":
+            # New mode: use all regular Forge img2img controls (prompt, denoise,
+            # LoRAs, ControlNet/scripts, etc.) first, then upscale that output.
+            processed_base = run_base_forge_generation("img2img")
+
             if shared.state.interrupted:
-                 return Processed(p, [], p.seed, "Interrupted")
+                print("[SeedVR2] Interrupted during Img2Img generation. Stopping SeedVR2.")
+                return processed_base
+
+            if not processed_base.images:
+                return processed_base
+
+            input_img = processed_base.images[0]
+
+            if save_original:
+                images.save_image(
+                    input_img, p.outpath_samples, "", processed_base.seed, p.prompt,
+                    shared.opts.samples_format, info=processed_base.info, p=p, suffix="-img2img-original"
+                )
+
+        else:
+            # Legacy Img2Img behavior: bypass diffusion and upscale the input image.
+            if shared.state.interrupted:
+                return Processed(p, [], p.seed, "Interrupted")
+            if not getattr(p, "init_images", None):
+                return Processed(p, [], p.seed, "SeedVR2: no img2img input image found")
             input_img = p.init_images[0]
 
         # --- 显存清理 ---
